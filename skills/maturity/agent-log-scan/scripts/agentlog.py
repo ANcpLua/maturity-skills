@@ -68,10 +68,22 @@ API_RE = re.compile(
     r"|context window exceeded|no conversation found|connection error\b)"
 )
 
-# Usage-limit markers.
+# Usage-limit markers: only the two texts the harness injects verbatim,
+# anchored at the very start of the node text. Observed ground truth in
+# real transcripts:
+#   - type=user, isMeta=true, message.content is a plain string
+#     "[Usage limit approaching. Checkpoint now: ...]" (turn companion)
+#   - type=user, isMeta=true, origin.kind=auto-continuation,
+#     "Your claude.ai usage limit has reset. Continue the task ..."
+#   - type=queue-operation, top-level content string with the same
+#     reset text (the enqueue record of that auto-continuation)
+# Conversational mentions (prose about limits, quoted sentinels inside
+# tool results or task prompts) are excluded structurally: the marker is
+# only applied to isMeta user turns and non-message entries whose text
+# starts with one of these sentinels (see parse_node).
 LIMIT_RE = re.compile(
-    r"(?i)(usage limit|limit approaching|limit has reset"
-    r"|limit will reset|out of extra usage|weekly limit|session limit)"
+    r"^(?:\[?Usage limit approaching\."
+    r"|Your claude\.ai usage limit has reset\.)"
 )
 
 # Signature normalization: strip paths, ids, hex, numbers.
@@ -250,7 +262,13 @@ def parse_node(entry, line_no, offset, size, show_text):
         # opaque timestamped filler; still scan a top-level string content.
         c = entry.get("content")
         if isinstance(c, str):
-            node.markers = tuple(scan_markers(c[:TEXT_CAP]))
+            markers = scan_markers(c[:TEXT_CAP])
+            # Harness injection records (e.g. queue-operation enqueue of
+            # the usage-limit auto-continuation) carry the sentinel at
+            # the start of their top-level content string.
+            if LIMIT_RE.match(c):
+                markers.append("limit")
+            node.markers = tuple(markers)
         return node
 
     msg = entry.get("message")
@@ -311,6 +329,15 @@ def parse_node(entry, line_no, offset, size, show_text):
                     markers.update(scan_markers(t[:TEXT_CAP]))
                     node.meaningful = True
 
+    # Harness-injected usage-limit turns are user entries flagged
+    # isMeta=true whose text STARTS with the injected sentinel. Anything
+    # else (agent prose, tool results, users quoting the sentinel) is a
+    # conversational mention and never gets the limit marker.
+    if node.etype == "user" and entry.get("isMeta") is True:
+        inj_text = content if isinstance(content, str) else first_text
+        if isinstance(inj_text, str) and LIMIT_RE.match(inj_text):
+            markers.add("limit")
+
     node.tools = tuple(tools)
     node.results = tuple(results)
     node.markers = tuple(sorted(markers))
@@ -320,13 +347,14 @@ def parse_node(entry, line_no, offset, size, show_text):
 
 
 def scan_markers(text):
+    # "limit" is NOT text-scanned here: it is structural (harness-injected
+    # nodes only) and applied in parse_node via LIMIT_RE.match at text
+    # start, so conversational mentions of limits never carry it.
     found = []
     if PERM_RE.search(text):
         found.append("permission")
     if API_RE.search(text):
         found.append("api")
-    if LIMIT_RE.search(text):
-        found.append("limit")
     return found
 
 
@@ -441,10 +469,11 @@ def scan_file(path, agg, show_text):
         if "permission" in node.markers:
             perm_hits.append((line_no, offset,
                               node.snippet if show_text else None))
-        # Limit markers on assistant nodes are the agent talking ABOUT
-        # limits; real limit interruptions are injected as user/system
-        # entries, so only those count.
-        if "limit" in node.markers and node.etype != "assistant":
+        # The limit marker is structural (parse_node sets it only on
+        # harness-injected isMeta user turns and injection records like
+        # queue-operation whose text starts with the sentinel), so every
+        # marked node is a real interruption, never a mention.
+        if "limit" in node.markers:
             limit_hits.append((line_no, offset, node_index,
                                node.snippet if show_text else None))
         if node.etype in ("user", "assistant") and node.meaningful:
