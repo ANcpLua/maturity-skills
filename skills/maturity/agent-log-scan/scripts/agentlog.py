@@ -220,17 +220,19 @@ class Node(object):
                  "tools", "results", "markers", "meaningful", "snippet")
 
     def __init__(self):
+        # Annotations are for type checkers only; function-body annotations are
+        # never evaluated at runtime, so the 3.9 floor is unaffected.
         self.line = 0
         self.offset = 0
         self.size = 0
         self.etype = "?"
-        self.role = None
-        self.ts = None
+        self.role: "str | None" = None
+        self.ts: "float | None" = None
         self.tools = ()        # tool_use names on this node
         self.results = ()      # (tool_use_id, is_err, sig) per tool_result
         self.markers = ()      # marker classes found in text
         self.meaningful = False
-        self.snippet = None
+        self.snippet: "str | None" = None
 
 
 def parse_node(entry, line_no, offset, size, show_text):
