@@ -38,6 +38,11 @@ both.
 - **[perf-gate](./skills/maturity/perf-gate/SKILL.md)**: Measure the
   project's own performance claims (README, docs) against reality and
   attribute regressions to code before accusing it.
+- **[agent-log-scan](./skills/maturity/agent-log-scan/SKILL.md)**: Mine
+  agent-transcript corpora for antipatterns (retry-loops, permission-thrash,
+  API dead-ends, limit interruptions) with a deterministic streaming scanner,
+  and turn them into allowlist, routine, and harness changes. The agent reads
+  the aggregate, never the raw logs.
 
 ## Layout
 

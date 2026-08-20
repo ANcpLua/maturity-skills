@@ -1,0 +1,3 @@
+interface:
+  display_name: "Agent Log Scan"
+  short_description: "Mine agent transcripts for antipatterns without reading them"

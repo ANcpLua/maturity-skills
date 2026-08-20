@@ -20,6 +20,7 @@
   "skills": [
     "./skills/maturity/mutation-tester",
     "./skills/maturity/emitter-corpus",
-    "./skills/maturity/perf-gate"
+    "./skills/maturity/perf-gate",
+    "./skills/maturity/agent-log-scan"
   ]
 }
