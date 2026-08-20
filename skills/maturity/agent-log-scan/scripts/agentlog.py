@@ -48,12 +48,17 @@ TOOLERR_RE = re.compile(
     r"|operation not permitted|is not recognized as)"
 )
 
-# Permission / classifier denial markers.
+# Permission / classifier denial markers. Denial-shaped phrases only:
+# "auto mode classifier" alone also appears in ALLOW decisions,
+# "permission prompt" appears in documentation text, and a bare
+# "denied permission" appears in the boilerplate warning attached to
+# every cross-session peer message -- none of those count.
 PERM_RE = re.compile(
-    r"(?i)(permission[^\n]{0,80}denied|denied[^\n]{0,40}permission"
-    r"|auto ?mode classifier|was rejected|requested permissions"
+    r"(?i)(permission[^\n]{0,80}denied|user denied[^\n]{0,40}permission"
+    r"|classifier denied|denied by [^\n]{0,40}classifier"
+    r"|was rejected|requested permissions"
     r"|user (?:doesn'?t|does not) want to proceed"
-    r"|haven'?t granted|requires approval|permission prompt)"
+    r"|haven'?t granted|requires approval)"
 )
 
 # API dead-end markers (session-fatal API/harness errors).
@@ -79,6 +84,11 @@ _RE_HEX = re.compile(r"\b[0-9a-fA-F]{7,}\b")
 _RE_NUM = re.compile(r"\d+")
 _RE_WS = re.compile(r"\s+")
 _RE_CTRL = re.compile(r"[\x00-\x1f\x7f]")
+
+# A successful Read/file result: cat -n style "<lineno>\t..." content.
+# Its text is file source, not tool output, so error words inside it
+# (e.g. "InvalidOperationException" in C#) are not tool errors.
+_RE_CATN = re.compile(r"^\s{0,8}\d+\t")
 
 DETECTOR_GATE = ("retry-loop", "permission-thrash", "api-dead-end",
                  "limit-interrupt")
@@ -167,9 +177,16 @@ def iter_jsonl(path):
             offset += len(raw)
 
 
+def path_error(p):
+    """Explain why a path is unusable ('' if it is a regular file/dir)."""
+    if os.path.exists(p):
+        return "not a regular file or directory: %s" % p
+    return "no such file or directory: %s" % p
+
+
 def collect_files(paths):
     """Expand args into a sorted list of .jsonl files. Returns (files,
-    errors)."""
+    error_messages)."""
     files = []
     errors = []
     for p in paths:
@@ -183,7 +200,7 @@ def collect_files(paths):
                     if name.endswith(".jsonl"):
                         files.append(os.path.join(root, name))
         else:
-            errors.append(p)
+            errors.append(path_error(p))
     # de-dupe, keep deterministic order
     seen = set()
     uniq = []
@@ -267,8 +284,14 @@ def parse_node(entry, line_no, offset, size, show_text):
                 for t in iter_texts(block.get("content")):
                     text = t
                     break
-                is_err = block.get("is_error") is True
-                if not is_err and text and TOOLERR_RE.search(text[:TEXT_CAP]):
+                err_flag = block.get("is_error")
+                is_err = err_flag is True
+                # Fall back to text markers ONLY when is_error is absent;
+                # an explicit false means the tool succeeded even if its
+                # output happens to contain words like "exception".
+                if err_flag is None and text and \
+                        not _RE_CATN.match(text) and \
+                        TOOLERR_RE.search(text[:TEXT_CAP]):
                     is_err = True
                 sig = normalize_signature(text) if (is_err and text) else None
                 results.append((rid if isinstance(rid, str) else None,
@@ -416,8 +439,12 @@ def scan_file(path, agg, show_text):
         if "permission" in node.markers:
             perm_hits.append((line_no, offset,
                               node.snippet if show_text else None))
-        if "limit" in node.markers:
-            limit_hits.append((line_no, offset, node_index))
+        # Limit markers on assistant nodes are the agent talking ABOUT
+        # limits; real limit interruptions are injected as user/system
+        # entries, so only those count.
+        if "limit" in node.markers and node.etype != "assistant":
+            limit_hits.append((line_no, offset, node_index,
+                               node.snippet if show_text else None))
         if node.etype in ("user", "assistant") and node.meaningful:
             last_meaningful = (line_no, offset, node_index, node)
         node_index += 1
@@ -437,24 +464,32 @@ def scan_file(path, agg, show_text):
                 j += 1
             if j - i >= RETRY_MIN:
                 sigs = Counter(s[2] for s in results_seq[i:j] if s[2])
-                agg.findings["retry-loop"].append({
+                finding = {
                     "file": path, "line": results_seq[i][3],
                     "offset": results_seq[i][4], "tool": tool,
                     "count": j - i,
                     "signature": (sigs.most_common(1)[0][0]
                                   if sigs else "(no error text)"),
-                })
+                }
+                if show_text:
+                    finding["snippet"] = next(
+                        (s[5] for s in results_seq[i:j] if s[5]), None)
+                agg.findings["retry-loop"].append(finding)
             i = j
         else:
             i += 1
 
     # --- detector: permission-thrash ------------------------------------
     if len(perm_hits) >= PERM_MIN:
-        agg.findings["permission-thrash"].append({
+        finding = {
             "file": path, "line": perm_hits[0][0],
             "offset": perm_hits[0][1], "count": len(perm_hits),
             "last_line": perm_hits[-1][0],
-        })
+        }
+        if show_text:
+            finding["snippet"] = next(
+                (h[2] for h in perm_hits if h[2]), None)
+        agg.findings["permission-thrash"].append(finding)
 
     # --- detector: api-dead-end -----------------------------------------
     if last_meaningful is not None:
@@ -471,19 +506,25 @@ def scan_file(path, agg, show_text):
                 if s:
                     sig = s
                     break
-            agg.findings["api-dead-end"].append({
+            finding = {
                 "file": path, "line": line_no, "offset": offset,
                 "reason": reason,
                 "signature": sig or "(marker on final node)",
-            })
+            }
+            if show_text:
+                finding["snippet"] = node.snippet
+            agg.findings["api-dead-end"].append(finding)
 
     # --- detector: limit-interrupt --------------------------------------
     last_idx = last_meaningful[2] if last_meaningful else -1
-    for line_no, offset, idx in limit_hits:
-        agg.findings["limit-interrupt"].append({
+    for line_no, offset, idx, snippet in limit_hits:
+        finding = {
             "file": path, "line": line_no, "offset": offset,
             "continued": idx < last_idx,
-        })
+        }
+        if show_text:
+            finding["snippet"] = snippet
+        agg.findings["limit-interrupt"].append(finding)
 
 
 def render_md(agg, top, elapsed, show_text):
@@ -513,10 +554,19 @@ def render_md(agg, top, elapsed, show_text):
         w("| " + " | ".join(header) + " |")
         w("|" + "|".join("---" for _ in header) + "|")
         for r in rows:
-            w("| " + " | ".join(str(c) for c in r) + " |")
+            w("| " + " | ".join(str(c).replace("|", "\\|") for c in r)
+              + " |")
         w("")
 
+    def with_text(header, rowfn):
+        """Append a text column when --show-text is on."""
+        if not show_text:
+            return header, rowfn
+        return (header + ["text"],
+                lambda f: tuple(rowfn(f)) + (f.get("snippet") or "-",))
+
     def section(name, items, header, rowfn):
+        header, rowfn = with_text(header, rowfn)
         shown = items[:top]
         more = len(items) - len(shown)
         title = "### %s (%d)" % (name, len(items))
@@ -629,7 +679,7 @@ def render_json(agg, top, elapsed, exit_code):
 def cmd_scan(args):
     files, errors = collect_files(args.paths)
     for e in errors:
-        sys.stderr.write("agentlog: no such file or directory: %s\n" % e)
+        sys.stderr.write("agentlog: %s\n" % e)
     if errors:
         return 1
     if not files:
@@ -698,7 +748,7 @@ def summarize_node(line_no, offset, raw, show_text, mark):
 def cmd_slice(args):
     path = os.path.expanduser(args.file)
     if not os.path.isfile(path):
-        sys.stderr.write("agentlog: no such file: %s\n" % path)
+        sys.stderr.write("agentlog: %s\n" % path_error(path))
         return 1
     target = args.line
     k = args.around
@@ -760,7 +810,7 @@ def cosine_distance(a, b):
 def cmd_bisect(args):
     path = os.path.expanduser(args.file)
     if not os.path.isfile(path):
-        sys.stderr.write("agentlog: no such file: %s\n" % path)
+        sys.stderr.write("agentlog: %s\n" % path_error(path))
         return 1
     if args.metric != "cohesion":
         sys.stderr.write("agentlog: unknown metric: %s\n" % args.metric)
