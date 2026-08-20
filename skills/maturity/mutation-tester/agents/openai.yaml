@@ -1,0 +1,3 @@
+interface:
+  display_name: "Mutation Tester"
+  short_description: "Turn surviving mutants into targeted tests"

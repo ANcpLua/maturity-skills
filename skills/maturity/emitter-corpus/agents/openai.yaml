@@ -1,0 +1,3 @@
+interface:
+  display_name: "Emitter Corpus"
+  short_description: "Validate a parser against real upstream producers' files"

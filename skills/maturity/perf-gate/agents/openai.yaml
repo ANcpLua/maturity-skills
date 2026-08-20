@@ -1,0 +1,3 @@
+interface:
+  display_name: "Perf Gate"
+  short_description: "Measure the project's own performance claims against reality"

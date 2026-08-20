@@ -1,0 +1,22 @@
+{
+  "name": "ancplua",
+  "owner": {
+    "name": "ANcpLua",
+    "url": "https://github.com/ANcpLua"
+  },
+  "description": "ANcpLua's maintenance-routine skills, as an installable Claude Code plugin.",
+  "plugins": [
+    {
+      "name": "maturity-skills",
+      "source": "./",
+      "description": "Evidence-first maintenance routines: mutation testing, emitter-corpus validation, performance-claim gating.",
+      "category": "engineering",
+      "keywords": [
+        "maintenance",
+        "mutation-testing",
+        "performance",
+        "code-quality"
+      ]
+    }
+  ]
+}

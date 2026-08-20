@@ -1,0 +1,25 @@
+{
+  "name": "maturity-skills",
+  "version": "0.1.0",
+  "description": "Evidence-first maintenance routines for codebases: mutation testing, emitter-corpus validation, and performance-claim gating. Findings need repros, not vibes.",
+  "author": {
+    "name": "ANcpLua",
+    "url": "https://github.com/ANcpLua"
+  },
+  "homepage": "https://github.com/ANcpLua/maturity-skills",
+  "repository": "https://github.com/ANcpLua/maturity-skills",
+  "license": "MIT",
+  "keywords": [
+    "maintenance",
+    "mutation-testing",
+    "parser-validation",
+    "performance",
+    "code-quality",
+    "skills"
+  ],
+  "skills": [
+    "./skills/maturity/mutation-tester",
+    "./skills/maturity/emitter-corpus",
+    "./skills/maturity/perf-gate"
+  ]
+}
