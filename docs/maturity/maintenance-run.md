@@ -5,8 +5,9 @@
 Runs the whole maintenance loop as one routine: parallel read-only finders
 (reusing the sibling maturity skills as finder dimensions), root-cause
 dedupe before verification — the bundled deterministic tool
-(`scripts/findings.py`) merges the mechanical share and the dedupe arbiter
-judges only its `ambiguous` residue — an adversarial verifier per cluster
+(`scripts/findings.py`) merges the mechanical share and flags the rest on
+an `ambiguous` list the dedupe arbiter judges, with split-and-merge
+authority backed by stated code evidence — an adversarial verifier per cluster
 with authority to override the proposed fix, a fixer fleet with disjoint
 file ownership in isolated worktrees, single-writer integration, a run
 report, and a hard termination rule that ends the loop when it starts
@@ -33,17 +34,19 @@ the same code for the same reason are one cluster.
 doctrine: agents treat prompt rules as guidelines and lose them
 mid-context; a deterministic tool with an exit code does not negotiate.
 `scripts/findings.py dedupe` merges only the provably mechanical share —
-same file within a line window, near-identical normalized root-cause
-signatures, identical normalized titles, transitive closure — with
-byte-identical output for the same input, and emits an explicit
-`ambiguous` list, the only part the arbiter still judges (plus split
-authority over tool clusters, with stated reasons: line proximity can
-fuse neighbors that merely live on adjacent lines). Replayed against
-run 002's ground truth, the tool reproduces the co-located merges
-mechanically and the ambiguous list carries part of the rest — the
-cross-file root-cause merges are exactly where the arbiter's code
-reading remains load-bearing, which is why finders should emit a real
-per-finding `root_cause` field for the signature rule to bite on.
+near-identical normalized root-cause signatures and identical normalized
+titles, transitive closure — with byte-identical output for the same
+input. Line proximity never merges: replayed against run 002's arbiter
+ground truth, 4 of 7 same-file near-line pairs were distinct claims and
+no window setting separates them (the closest false pair sat one line
+apart while a true pair sat fourteen apart), so near-line pairs are
+flagged on the explicit `ambiguous` list with their distance instead of
+being fused. The arbiter judges that list, may split a tool cluster with
+a stated reason, and may merge unflagged pairs with stated code
+evidence — tool merges are a floor, not a ceiling. The cross-file
+root-cause merges are exactly where the arbiter's code reading remains
+load-bearing, which is why the handoff requires a real per-finding
+`root_cause` field for the signature rule to bite on.
 
 **Why does the verifier override the finder's fix?** Across four runs the
 refute-by-default verifiers' `fix_adjustment` prevented at least five wrong

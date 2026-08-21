@@ -3,24 +3,34 @@
 
 Mechanizes the mechanical share of the maintenance-run dedupe-arbiter step
 (SKILL.md step 2). Prompt rules decay mid-context; a tool with an exit code
-does not negotiate. The tool merges only what is provably mechanical and
-hands the LLM arbiter an explicit `ambiguous` list -- the ONLY part still
-judged -- plus split authority over tool clusters.
+does not negotiate. The tool merges only what is provably mechanical --
+root-cause signature overlap or title identity -- and hands the LLM
+arbiter an explicit `ambiguous` list of flagged pairs. The arbiter's
+judgment stays load-bearing at the edges: it may split a tool cluster and
+may merge unflagged pairs, in both cases with stated code evidence
+(SKILL.md step 2 owns those rules); the tool's floor is what it never
+re-litigates.
 
 Subcommands:
   dedupe <findings.json> [--json|--md] [--window N]
-      Cluster raw findings by transitive closure over three join rules:
-        (a) same normalized file AND lines within +-window (default 15);
-        (b) root-cause signature token-set overlap >= 1/2 (Jaccard,
+      Cluster raw findings by transitive closure over two join rules:
+        (a) root-cause signature token-set overlap >= 1/2 (Jaccard,
             compared in exact integer arithmetic; signature = root_cause,
             falling back to title, normalized agentlog-style: lowercase,
             paths/uuids/hex-runs/numbers stripped, whitespace collapsed);
-        (c) identical normalized title.
+        (b) identical normalized title.
+      Line proximity NEVER merges: replayed against maintenance run-002's
+      arbiter ground truth, 4 of 7 same-file near-line pairs were distinct
+      claims (the closest false pair sat 1 line apart while a true pair
+      sat 14 apart), so no window separates them. Same-file pairs with
+      lines within +-window (default 15) are FLAGGED on the `ambiguous`
+      list instead, with their line distance.
       Output: clusters (chosen primary = highest severity, then longest
       evidence, then lowest index; max severity; merged categories and
       dimensions; the spanning merge edges with their reasons) plus the
-      `ambiguous` list: different-cluster pairs whose signature overlap
-      is >= 1/8 but below the 1/2 join threshold.
+      `ambiguous` list: different-cluster pairs flagged `file-window`
+      (same file, lines within +-window) and/or `near-signature`
+      (signature overlap >= 1/8 but below the 1/2 join threshold).
   validate <findings.json>
       Schema check with actionable per-field errors.
 
@@ -46,10 +56,10 @@ from fractions import Fraction
 
 # ---------------------------------------------------------------- constants
 
-DEFAULT_WINDOW = 15      # +-lines for the same-file join rule (a)
-JOIN_SIM = Fraction(1, 2)    # rule (b): token-set Jaccard >= 1/2 joins
-AMBIG_SIM = Fraction(1, 8)   # [1/8, 1/2): ambiguous pair for the arbiter
-MIN_TOKENS = 3           # signatures with fewer tokens never fire (b)
+DEFAULT_WINDOW = 15      # +-lines for the same-file ambiguous flag
+JOIN_SIM = Fraction(1, 2)    # rule (a): token-set Jaccard >= 1/2 joins
+AMBIG_SIM = Fraction(1, 8)   # [1/8, 1/2): near-signature ambiguous flag
+MIN_TOKENS = 3           # signatures with fewer tokens never fire (a)
 MD_AMBIG_CAP = 50        # md shows at most this many ambiguous pairs
 
 SEV_RANK = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1}
@@ -245,28 +255,49 @@ def prepare(findings):
     return prepped
 
 
-def pair_reasons(a, b, window):
-    """Deterministic join reasons for one pair (may be empty)."""
+def pair_signature_sim(a, b):
+    """Exact token-set Jaccard, or None when not computable (either
+    signature is below MIN_TOKENS, or the union is empty)."""
+    if len(a.tokens) < MIN_TOKENS or len(b.tokens) < MIN_TOKENS:
+        return None
+    union = len(a.tokens | b.tokens)
+    if not union:
+        return None
+    return Fraction(len(a.tokens & b.tokens), union)
+
+
+def pair_join_reasons(a, b, sim):
+    """Deterministic join reasons for one pair (may be empty).
+
+    Line proximity is deliberately NOT a join reason: on run-002's
+    ground truth 4 of 7 same-file near-line pairs were distinct claims,
+    and no window separates them (closest false pair 1 line apart, a
+    true pair 14 apart). Near-line pairs are flagged ambiguous instead.
+    """
     reasons = []
-    if a.line is not None and b.line is not None \
-            and same_file(a.fsegs, b.fsegs) \
-            and abs(a.line - b.line) <= window:
-        reasons.append("file-window")
-    if len(a.tokens) >= MIN_TOKENS and len(b.tokens) >= MIN_TOKENS:
-        inter = len(a.tokens & b.tokens)
-        union = len(a.tokens | b.tokens)
-        if union and Fraction(inter, union) >= JOIN_SIM:
-            reasons.append("signature")
+    if sim is not None and sim >= JOIN_SIM:
+        reasons.append("signature")
     if a.ntitle and a.ntitle == b.ntitle:
         reasons.append("title")
     return reasons
+
+
+def pair_window_distance(a, b, window):
+    """Line distance when both findings carry a line in the same file
+    and sit within +-window, else None."""
+    if a.line is not None and b.line is not None \
+            and same_file(a.fsegs, b.fsegs) \
+            and abs(a.line - b.line) <= window:
+        return abs(a.line - b.line)
+    return None
 
 
 def dedupe(findings, window):
     """Return (clusters, ambiguous, merges).
 
     clusters: list of dicts sorted by min member index.
-    ambiguous: list of dicts sorted by similarity desc, then (a, b).
+    ambiguous: list of dicts, file-window flags first (distance asc),
+    then near-signature flags (similarity desc), ties by (a, b).
     merges: how many findings were merged away (n - len(clusters)).
     """
     pp = prepare(findings)
@@ -280,25 +311,24 @@ def dedupe(findings, window):
         return x
 
     merge_edges = []   # spanning edges: (i, j, reasons) that united roots
-    band_pairs = []    # (frac, i, j) candidates for the ambiguous list
+    flag_pairs = []    # (i, j, distance-or-None, frac-or-None) ambiguous
 
     for i in range(n):
         a = pp[i]
         for j in range(i + 1, n):
             b = pp[j]
-            reasons = pair_reasons(a, b, window)
+            sim = pair_signature_sim(a, b)
+            reasons = pair_join_reasons(a, b, sim)
             if reasons:
                 ra, rb = find(i), find(j)
                 if ra != rb:
                     parent[max(ra, rb)] = min(ra, rb)
                     merge_edges.append((i, j, reasons))
-            elif len(a.tokens) >= MIN_TOKENS \
-                    and len(b.tokens) >= MIN_TOKENS:
-                union = len(a.tokens | b.tokens)
-                if union:
-                    frac = Fraction(len(a.tokens & b.tokens), union)
-                    if frac >= AMBIG_SIM:
-                        band_pairs.append((frac, i, j))
+                continue
+            dist = pair_window_distance(a, b, window)
+            near = sim is not None and sim >= AMBIG_SIM
+            if dist is not None or near:
+                flag_pairs.append((i, j, dist, sim))
 
     groups = {}
     for i in range(n):
@@ -331,17 +361,32 @@ def dedupe(findings, window):
             "merge_edges": edges,
         })
 
+    def flag_key(t):
+        i, j, dist, frac = t
+        if dist is not None:      # file-window first, closest lines first
+            return (0, dist, 0, i, j)
+        return (1, 0, -frac, i, j)   # then near-signature, most similar
+
     ambiguous = []
-    for frac, i, j in sorted(band_pairs, key=lambda t: (-t[0], t[1], t[2])):
+    for i, j, dist, frac in sorted(flag_pairs, key=flag_key):
         if cluster_of[i] == cluster_of[j]:
             continue   # already joined transitively; nothing to judge
+        reasons = []
+        if dist is not None:
+            reasons.append("file-window")
+        if frac is not None and frac >= AMBIG_SIM:
+            reasons.append("near-signature")
         ambiguous.append({
             "a": i,
             "b": j,
             "a_cluster": cluster_of[i],
             "b_cluster": cluster_of[j],
-            "similarity": "%d/%d" % (frac.numerator, frac.denominator),
-            "pct": (100 * frac.numerator) // frac.denominator,
+            "reasons": reasons,
+            "line_distance": dist,
+            "similarity": ("%d/%d" % (frac.numerator, frac.denominator)
+                           if frac is not None else None),
+            "pct": ((100 * frac.numerator) // frac.denominator
+                    if frac is not None else None),
             "relation": ("same-file" if same_file(pp[i].fsegs, pp[j].fsegs)
                          else "cross-file"),
             "a_title": pp[i].title,
@@ -390,9 +435,10 @@ def render_md(path, n, window, clusters, ambiguous, merges, exit_code):
     w("")
     w("- input: %s (%d findings) -> %d clusters (%d merged away)"
       % (path, n, len(clusters), merges))
-    w("- params: window +-%d lines | join >= %s token-set overlap | "
-      "ambiguous >= %s | min tokens %d"
-      % (window, JOIN_SIM, AMBIG_SIM, MIN_TOKENS))
+    w("- params: join >= %s token-set overlap or identical title | "
+      "flags: file-window +-%d lines, near-signature >= %s | "
+      "min tokens %d"
+      % (JOIN_SIM, window, AMBIG_SIM, MIN_TOKENS))
     w("- exit code: %d (%s)" % (exit_code,
                                 "merges happened" if exit_code == 2
                                 else "nothing merged"))
@@ -438,16 +484,26 @@ def render_md(path, n, window, clusters, ambiguous, merges, exit_code):
         w("none")
         w("")
 
-    w("## Ambiguous pairs (%d) -- the arbiter judges ONLY these"
-      % len(ambiguous))
+    w("## Ambiguous pairs (%d) -- arbiter judgment required" % len(ambiguous))
+    w("")
+    w("file-window = same file, lines within +-%d (line proximity is a "
+      "lead, NOT proof: on run-002 ground truth 4 of 7 near-line pairs "
+      "were distinct claims). near-signature = token-set overlap in "
+      "[%s, %s). Judge each pair; the arbiter may also merge unflagged "
+      "pairs with stated code evidence and may split any cluster above."
+      % (window, AMBIG_SIM, JOIN_SIM))
     w("")
     if ambiguous:
-        w("| a | b | clusters | sim | relation | titles |")
-        w("|---|---|---|---|---|---|")
+        w("| a | b | clusters | why | dist | sim | relation | titles |")
+        w("|---|---|---|---|---|---|---|---|")
         for p in ambiguous[:MD_AMBIG_CAP]:
-            w("| #%d | #%d | %s vs %s | %s (%d%%) | %s | %s / %s |"
+            sim = ("%s (%d%%)" % (p["similarity"], p["pct"])
+                   if p["similarity"] is not None else "-")
+            dist = (str(p["line_distance"])
+                    if p["line_distance"] is not None else "-")
+            w("| #%d | #%d | %s vs %s | %s | %s | %s | %s | %s / %s |"
               % (p["a"], p["b"], p["a_cluster"], p["b_cluster"],
-                 p["similarity"], p["pct"], p["relation"],
+                 ", ".join(p["reasons"]), dist, sim, p["relation"],
                  _short(p["a_title"], 45), _short(p["b_title"], 45)))
         w("")
         if len(ambiguous) > MD_AMBIG_CAP:
@@ -468,6 +524,18 @@ def cmd_dedupe(args):
         for e in errors:
             sys.stderr.write("findings: %s\n" % e)
         return 1
+    missing_rc = sum(
+        1 for e in findings
+        if isinstance(e, dict) and not (
+            isinstance(e.get("root_cause"), str)
+            and e["root_cause"].strip()))
+    if missing_rc:
+        sys.stderr.write(
+            "findings: note: %d/%d findings have no root_cause; the "
+            "signature rule falls back to titles and under-merges -- "
+            "cross-file duplicates of one root cause will surface only "
+            "on the ambiguous list or via arbiter code evidence\n"
+            % (missing_rc, len(findings)))
     clusters, ambiguous, merges = dedupe(findings, args.window)
     exit_code = 2 if merges else 0
     render = render_json if args.json else render_md
@@ -504,9 +572,10 @@ def main(argv=None):
     parser = Parser(
         prog="findings.py",
         description="Deterministic root-cause dedupe for maintenance-run "
-                    "findings. Exit 2 means merges happened; the "
-                    "`ambiguous` list is the only part an LLM arbiter "
-                    "still judges.")
+                    "findings. Merges only signature/title-identity "
+                    "joins; same-file near-line pairs are flagged on the "
+                    "`ambiguous` list for the LLM arbiter, never merged. "
+                    "Exit 2 means merges happened.")
     sub = parser.add_subparsers(dest="command")
 
     p_d = sub.add_parser("dedupe", help="cluster raw findings")
@@ -519,7 +588,8 @@ def main(argv=None):
                      help="markdown output (default)")
     p_d.add_argument("--window", type=int, default=DEFAULT_WINDOW,
                      metavar="N",
-                     help="same-file line window (default %d)"
+                     help="same-file line window for the file-window "
+                          "ambiguous flag (default %d; never merges)"
                           % DEFAULT_WINDOW)
 
     p_v = sub.add_parser("validate", help="schema-check a findings file")
