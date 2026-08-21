@@ -9,6 +9,6 @@ Every `SKILL.md` is either:
   rich trigger phrasing (the situations and words that should make an agent
   reach for it), because that description is all the model sees when deciding.
 
-All three maturity routines are model-invoked: they are audit tools an agent
+All maturity routines are model-invoked: they are audit tools an agent
 should reach for when the user describes the problem, not ceremonies the user
 must know by name.
