@@ -3,12 +3,14 @@
 ## What it does
 
 Runs the whole maintenance loop as one routine: parallel read-only finders
-(reusing the sibling maturity skills as finder dimensions), a dedupe arbiter
-that clusters raw findings by root cause before verification, an adversarial
-verifier per cluster with authority to override the proposed fix, a fixer
-fleet with disjoint file ownership in isolated worktrees, single-writer
-integration, a run report, and a hard termination rule that ends the loop
-when it starts finding only its own regressions.
+(reusing the sibling maturity skills as finder dimensions), root-cause
+dedupe before verification — the bundled deterministic tool
+(`scripts/findings.py`) merges the mechanical share and the dedupe arbiter
+judges only its `ambiguous` residue — an adversarial verifier per cluster
+with authority to override the proposed fix, a fixer fleet with disjoint
+file ownership in isolated worktrees, single-writer integration, a run
+report, and a hard termination rule that ends the loop when it starts
+finding only its own regressions.
 
 ## When to reach for it
 
@@ -26,6 +28,22 @@ findings into 26 root-cause clusters first, and the verifiers then refuted
 0. Clustering spends every verifier pass on a distinct claim. The arbiter
 reads code where clustering is unclear; two findings whose fixes land on
 the same code for the same reason are one cluster.
+
+**Why is part of dedupe a tool instead of a judgment call?** House
+doctrine: agents treat prompt rules as guidelines and lose them
+mid-context; a deterministic tool with an exit code does not negotiate.
+`scripts/findings.py dedupe` merges only the provably mechanical share —
+same file within a line window, near-identical normalized root-cause
+signatures, identical normalized titles, transitive closure — with
+byte-identical output for the same input, and emits an explicit
+`ambiguous` list, the only part the arbiter still judges (plus split
+authority over tool clusters, with stated reasons: line proximity can
+fuse neighbors that merely live on adjacent lines). Replayed against
+run 002's ground truth, the tool reproduces the co-located merges
+mechanically and the ambiguous list carries part of the rest — the
+cross-file root-cause merges are exactly where the arbiter's code
+reading remains load-bearing, which is why finders should emit a real
+per-finding `root_cause` field for the signature rule to bite on.
 
 **Why does the verifier override the finder's fix?** Across four runs the
 refute-by-default verifiers' `fix_adjustment` prevented at least five wrong
@@ -50,7 +68,10 @@ scheduling, say so. Tuning notes never justify a next run on their own.
 
 Findings drop run over run while baselines (e.g. mutation score) rise, the
 verifiers refute near-zero clusters because dedupe already collapsed the
-duplicates, integration merges every fixer commit without conflicts, each
+duplicates (`findings.py dedupe` exits 2 when it merged anything, and the
+arbiter's attention went only to its `ambiguous` list and to splits it
+could state a reason for), integration merges every fixer commit without
+conflicts, each
 run report states the findings-curve datapoint with the self-introduced
 share, and the loop ends with an explicit closing report instead of
 trailing off into runs that only re-review themselves.

@@ -11,7 +11,9 @@ Fix the target scope, then launch read-only finders in parallel, one per dimensi
 
 ## 2. Dedupe by root cause BEFORE verification
 
-A dedupe arbiter clusters raw findings by root cause before any verification runs. Two findings whose fixes land on the same code for the same reason are one cluster. Where clustering is unclear from the finding text, the arbiter reads the code and decides. Verifying raw findings wastes verifier passes refuting duplicates after the fact; verifying clusters spends every pass on a distinct claim.
+Mechanical first: collect the raw findings as JSON (`title`/`file`/`category` required; `line`, `root_cause`, `severity`, `evidence`, `dimension` strongly encouraged — per-finding `root_cause` text is what the signature rule bites on) and run `scripts/findings.py dedupe <findings.json>` (Python 3 stdlib, deterministic: same input, byte-identical output; `validate` gates the finder handoff). It merges only what is provably mechanical — same file within a ±15-line window, root-cause signatures with ≥ 1/2 token-set overlap after agentlog-style normalization (paths/ids/hex/numbers stripped), or identical normalized titles — takes the transitive closure, picks each cluster's primary by severity then evidence, and reports every merge edge with its reason. Exit 2 means merges happened, 0 means nothing merged, 1 means the findings file is malformed (fix the finder output, don't hand-edit).
+
+The dedupe arbiter then judges ONLY the tool's `ambiguous` list — pairs whose signatures are similar but below the join threshold — reading the code where the pair text is not enough, and may SPLIT a tool cluster with a stated reason (line proximity does occasionally fuse neighboring-but-unrelated findings, e.g. two constants declared a line apart). The arbiter never re-clusters from scratch and never merges pairs the tool did not flag. Two findings whose fixes land on the same code for the same reason are one cluster. Verifying raw findings wastes verifier passes refuting duplicates after the fact; verifying clusters spends every pass on a distinct claim.
 
 ## 3. Adversarial verification per cluster
 
