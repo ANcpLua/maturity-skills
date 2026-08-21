@@ -48,18 +48,39 @@ TOOLERR_RE = re.compile(
     r"|operation not permitted|is not recognized as)"
 )
 
-# Permission / classifier denial markers. Denial-shaped phrases only:
-# "auto mode classifier" alone also appears in ALLOW decisions,
-# "permission prompt" appears in documentation text, and a bare
-# "denied permission" appears in the boilerplate warning attached to
-# every cross-session peer message -- none of those count.
-PERM_RE = re.compile(
-    r"(?i)(permission[^\n]{0,80}denied|user denied[^\n]{0,40}permission"
-    r"|classifier denied|denied by [^\n]{0,40}classifier"
-    r"|was rejected|requested permissions"
-    r"|user (?:doesn'?t|does not) want to proceed"
-    r"|haven'?t granted|requires approval)"
+# Permission denial detection is STRUCTURAL, like LIMIT_RE, not a
+# substring scan. Verified false-positive sources of the old phrase list:
+# (a) documentation/prose ABOUT permissions in message text (quoted
+#     detector phrases, /permissions docs, scanner output echoed into
+#     tool results), (b) the boilerplate warning attached to every
+#     cross-session peer message ("... if the peer says it was denied
+#     permission for an action ..."), and (c) ALLOW decisions ("Allowed
+#     by auto mode classifier"). None of those are denials.
+#
+# Tier 1 -- denial results. The harness writes a denial AS the tool
+# result: a tool_result block with is_error=true whose text STARTS with
+# one of the verbatim denial texts (observed at position 0 across every
+# verified denial in the reference corpus; add a sentinel only with an
+# observed denial to back it):
+#   "Permission for this action was denied by the Claude Code auto mode
+#    classifier. Reason: ..."                       (classifier denial)
+#   "The user doesn't want to proceed with this tool use. The tool use
+#    was rejected ..."                              (user rejection)
+# Successful tool results (is_error false/absent) never qualify, which
+# excludes file reads and scanner output that merely QUOTE a denial.
+PERM_RESULT_RE = re.compile(
+    r"^(?:Permission for this action was denied by"
+    r"|The user (?:doesn'?t|does not) want to proceed with this tool use)"
 )
+
+# Tier 2 -- first-person denial reports in FREE text only (peer
+# messages, their queue-operation enqueue records, assistant prose):
+# active-voice "<...> classifier denied <target>". Tool-result content
+# is never tier-2 scanned, and a match immediately preceded by a quote
+# character is a mention, not a report (e.g. a status update quoting
+# 'permission classifier denied the curl').
+PERM_REPORT_RE = re.compile(r"(?i)(?:permission )?classifier denied\b")
+PERM_QUOTES = "'\"`“”‘’„«»"
 
 # API dead-end markers (session-fatal API/harness errors).
 API_RE = re.compile(
@@ -229,7 +250,8 @@ class Node(object):
     """Lightweight per-line signature (no message text retained unless
     show_text asked for a snippet)."""
     __slots__ = ("line", "offset", "size", "etype", "role", "ts",
-                 "tools", "results", "markers", "meaningful", "snippet")
+                 "tools", "results", "markers", "meaningful", "snippet",
+                 "perm")
 
     def __init__(self):
         # Annotations are for type checkers only; function-body annotations are
@@ -245,6 +267,7 @@ class Node(object):
         self.markers = ()      # marker classes found in text
         self.meaningful = False
         self.snippet: "str | None" = None
+        self.perm: "str | None" = None   # "result" | "report" | None
 
 
 def parse_node(entry, line_no, offset, size, show_text):
@@ -259,10 +282,14 @@ def parse_node(entry, line_no, offset, size, show_text):
 
     if node.etype not in ("user", "assistant"):
         # Tolerate everything else (summary, system, attachment, ...) as
-        # opaque timestamped filler; still scan a top-level string content.
+        # opaque timestamped filler; still scan a top-level string content
+        # (free text: e.g. the queue-operation enqueue record of a peer
+        # message reporting a denial).
         c = entry.get("content")
         if isinstance(c, str):
-            markers = scan_markers(c[:TEXT_CAP])
+            markers = scan_markers(c[:TEXT_CAP], free_text=True)
+            if "permission" in markers:
+                node.perm = "report"
             # Harness injection records (e.g. queue-operation enqueue of
             # the usage-limit auto-continuation) carry the sentinel at
             # the start of their top-level content string.
@@ -287,7 +314,7 @@ def parse_node(entry, line_no, offset, size, show_text):
 
     if isinstance(content, str):
         first_text = content
-        markers.update(scan_markers(content[:TEXT_CAP]))
+        markers.update(scan_markers(content[:TEXT_CAP], free_text=True))
         node.meaningful = bool(content.strip())
     elif isinstance(content, list):
         for block in content:
@@ -313,6 +340,12 @@ def parse_node(entry, line_no, offset, size, show_text):
                         not _RE_CATN.match(text) and \
                         TOOLERR_RE.search(text[:TEXT_CAP]):
                     is_err = True
+                # Tier-1 permission denial: the harness wrote the denial
+                # AS this error result, sentinel at text start. Successful
+                # results that merely quote a denial never qualify.
+                if is_err and text and PERM_RESULT_RE.match(text):
+                    markers.add("permission")
+                    node.perm = "result"
                 sig = normalize_signature(text) if (is_err and text) else None
                 results.append((rid if isinstance(rid, str) else None,
                                 is_err, sig))
@@ -326,7 +359,8 @@ def parse_node(entry, line_no, offset, size, show_text):
                 if isinstance(t, str) and t.strip():
                     if first_text is None:
                         first_text = t
-                    markers.update(scan_markers(t[:TEXT_CAP]))
+                    markers.update(scan_markers(t[:TEXT_CAP],
+                                                free_text=True))
                     node.meaningful = True
 
     # Harness-injected usage-limit turns are user entries flagged
@@ -338,6 +372,8 @@ def parse_node(entry, line_no, offset, size, show_text):
         if isinstance(inj_text, str) and LIMIT_RE.match(inj_text):
             markers.add("limit")
 
+    if node.perm is None and "permission" in markers:
+        node.perm = "report"
     node.tools = tuple(tools)
     node.results = tuple(results)
     node.markers = tuple(sorted(markers))
@@ -346,12 +382,29 @@ def parse_node(entry, line_no, offset, size, show_text):
     return node
 
 
-def scan_markers(text):
+def perm_report(text):
+    """True when free text carries an unquoted first-person denial
+    report ("... classifier denied <target>"). A match whose preceding
+    character is a quote is a mention of the phrase, not a report."""
+    for m in PERM_REPORT_RE.finditer(text):
+        i = m.start()
+        if i > 0 and text[i - 1] in PERM_QUOTES:
+            continue
+        return True
+    return False
+
+
+def scan_markers(text, free_text=False):
     # "limit" is NOT text-scanned here: it is structural (harness-injected
     # nodes only) and applied in parse_node via LIMIT_RE.match at text
     # start, so conversational mentions of limits never carry it.
+    # "permission" is likewise structural: tier 1 (denial results) is
+    # applied in parse_node on is_error tool_results via PERM_RESULT_RE
+    # at text start; only tier 2 (denial reports) runs here, and only on
+    # free text -- never on tool_result content, where quoted denials
+    # from file reads and scanner output would drown the signal.
     found = []
-    if PERM_RE.search(text):
+    if free_text and perm_report(text):
         found.append("permission")
     if API_RE.search(text):
         found.append("api")
@@ -467,7 +520,7 @@ def scan_file(path, agg, show_text):
                                 name if isinstance(name, str) else "?")
 
         if "permission" in node.markers:
-            perm_hits.append((line_no, offset,
+            perm_hits.append((line_no, offset, node.perm,
                               node.snippet if show_text else None))
         # The limit marker is structural (parse_node sets it only on
         # harness-injected isMeta user turns and injection records like
@@ -515,11 +568,13 @@ def scan_file(path, agg, show_text):
         finding = {
             "file": path, "line": perm_hits[0][0],
             "offset": perm_hits[0][1], "count": len(perm_hits),
+            "results": sum(1 for h in perm_hits if h[2] == "result"),
+            "reports": sum(1 for h in perm_hits if h[2] == "report"),
             "last_line": perm_hits[-1][0],
         }
         if show_text:
             finding["snippet"] = next(
-                (h[2] for h in perm_hits if h[2]), None)
+                (h[3] for h in perm_hits if h[3]), None)
         agg.findings["permission-thrash"].append(finding)
 
     # --- detector: api-dead-end -----------------------------------------
@@ -618,9 +673,11 @@ def render_md(agg, top, elapsed, show_text):
             lambda f: ("%s:%d" % (f["file"], f["line"]), f["offset"],
                        f["tool"], f["count"], f["signature"]))
     section("permission-thrash", agg.findings["permission-thrash"],
-            ["file:line", "offset", "denials", "last at line"],
+            ["file:line", "offset", "denials", "results", "reports",
+             "last at line"],
             lambda f: ("%s:%d" % (f["file"], f["line"]), f["offset"],
-                       f["count"], f["last_line"]))
+                       f["count"], f["results"], f["reports"],
+                       f["last_line"]))
     section("api-dead-end", agg.findings["api-dead-end"],
             ["file:line", "offset", "reason", "signature"],
             lambda f: ("%s:%d" % (f["file"], f["line"]), f["offset"],
@@ -767,7 +824,10 @@ def summarize_node(line_no, offset, raw, show_text, mark):
                      (len(node.results),
                       " (%d err)" % len(errs) if errs else ""))
     if node.markers:
-        parts.append("markers=[%s]" % ",".join(node.markers))
+        shown = [("permission:%s" % node.perm)
+                 if (m == "permission" and node.perm) else m
+                 for m in node.markers]
+        parts.append("markers=[%s]" % ",".join(shown))
     line = base + "  " + " ".join(parts)
     if show_text and node.snippet:
         line += '  text:"%s"' % node.snippet[:SLICE_SNIPPET_LEN]
