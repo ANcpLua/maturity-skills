@@ -21,6 +21,8 @@
     "./skills/maturity/mutation-tester",
     "./skills/maturity/emitter-corpus",
     "./skills/maturity/perf-gate",
-    "./skills/maturity/agent-log-scan"
+    "./skills/maturity/agent-log-scan",
+    "./skills/maturity/regression-review",
+    "./skills/maturity/maintenance-run"
   ]
 }

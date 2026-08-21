@@ -1,0 +1,3 @@
+interface:
+  display_name: "Maintenance Run"
+  short_description: "Full find-verify-fix loop with a hard termination rule"

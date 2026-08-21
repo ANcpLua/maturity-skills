@@ -5,7 +5,7 @@ autonomous maintenance runs on [dotcov](https://github.com/ANcpLua/dotcov),
 where each of these routines earned its place by finding verified bugs that
 line coverage, linters, and review had all missed.
 
-The house rule across all three: **findings need repros, not vibes.** Every
+The house rule across all of them: **findings need repros, not vibes.** Every
 routine produces evidence (a killed-or-surviving mutant, a corpus file plus
 observed-vs-expected numbers, a measurement table) before anything is called
 a finding.
@@ -43,6 +43,18 @@ both.
   API dead-ends, limit interruptions) with a deterministic streaming scanner,
   and turn them into allowlist, routine, and harness changes. The agent reads
   the aggregate, never the raw logs.
+- **[regression-review](./skills/maturity/regression-review/SKILL.md)**:
+  Adversarially review only the previous change-set's diff for bugs that
+  change-set itself introduced. The newest code in a repo is the least
+  reviewed; every confirmed regression lands with its fix and a pinning
+  test.
+- **[maintenance-run](./skills/maturity/maintenance-run/SKILL.md)**:
+  Orchestrate the full find-verify-fix loop: parallel finders (the sibling
+  skills as dimensions), root-cause dedupe before verification, adversarial
+  verifiers with fix authority, a fixer fleet with disjoint ownership in
+  isolated worktrees, single-writer integration — and a hard termination
+  rule that ends the loop when a run's findings are predominantly its own
+  previous regressions.
 
 ## Layout
 

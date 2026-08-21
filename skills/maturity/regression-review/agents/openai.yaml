@@ -1,0 +1,3 @@
+interface:
+  display_name: "Regression Review"
+  short_description: "Hunt bugs the previous change-set itself introduced"

@@ -10,3 +10,5 @@ Model- or user-reachable (rich trigger phrasing so the model can reach for them)
 - **[emitter-corpus](./emitter-corpus/SKILL.md)**: Validate a parser/importer against a corpus of files as real upstream producers actually write them.
 - **[perf-gate](./perf-gate/SKILL.md)**: Measure the project's own performance claims (README, docs) against reality and attribute regressions to code.
 - **[agent-log-scan](./agent-log-scan/SKILL.md)**: Mine agent-transcript corpora for antipatterns with a streaming scanner and turn them into allowlist, routine, and harness changes — without reading raw logs.
+- **[regression-review](./regression-review/SKILL.md)**: Adversarially review only the previous change-set's diff for bugs that change-set itself introduced; every confirmed regression lands with its fix and a pinning test.
+- **[maintenance-run](./maintenance-run/SKILL.md)**: Orchestrate the full find-verify-fix loop — parallel finders, root-cause dedupe before verification, adversarial verifiers, a disjoint-ownership fixer fleet — with a hard termination rule.
