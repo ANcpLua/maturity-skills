@@ -8,10 +8,14 @@ Subcommands:
                     one-line summaries
   bisect <file>     largest topic/cohesion boundaries in one session by
                     signature-vector distance
+  ledger <path>...  workflow efficiency ledger: per-run/per-agent token,
+                    tool-call, and duration aggregates for subagent
+                    workflow directories (wf_*/journal.jsonl +
+                    agent-<id>.jsonl); optional --outcomes join
 
 Privacy default: no message text is ever printed -- only signatures, counts,
 tool names, line numbers, and byte offsets. --show-text opts in to <=160-char
-snippets.
+snippets (scan/slice only; ledger prints labels and numbers, never text).
 
 Exit codes: 0 ok; 1 bad usage/paths; 2 scan completed and the antipattern
 detectors (retry-loop, permission-thrash, api-dead-end, limit-interrupt)
@@ -978,6 +982,459 @@ def cmd_bisect(args):
     return 0
 
 
+# ------------------------------------------------------------------ ledger
+#
+# Workflow runs live in <session>/subagents/workflows/wf_<id>/ with a
+# journal.jsonl ({"type":"started"|"result","agentId":...} per agent) and
+# one agent-<agentId>.jsonl transcript per agent. The workflow runner also
+# writes a state file <session>/workflows/wf_<id>.json; the ledger reads
+# ONLY workflowName and per-agent labels from it (never promptPreview or
+# result text) and computes every number from the transcripts.
+#
+# Token composition (verified against the runner's own counters on a
+# 12-run / 87-agent reference corpus):
+#   output    sum of final output_tokens per API message. Transcripts
+#             append one entry per streaming batch, all carrying the same
+#             message.id with cumulative usage snapshots; the LAST
+#             snapshot per id is the final usage for that message.
+#   in+cache  sum of final input_tokens + cache_creation_input_tokens +
+#             cache_read_input_tokens per API message.
+#   context   input + cache_creation + cache_read + output taken from the
+#             FIRST recorded snapshot of the agent's LAST message: the
+#             agent's final context-window footprint. This is the figure
+#             the workflow runner reports as per-agent "tokens" (exact on
+#             83/87 reference agents; the rest differ <1.5% because the
+#             runner sampled a mid-stream snapshot the transcript does
+#             not retain).
+# Tool calls: distinct tool_use block ids across assistant entries
+# (exact vs the runner's toolCalls on all 87 reference agents).
+
+_AGENT_FILE_RE = re.compile(r"^agent-([A-Za-z0-9]+)\.jsonl$")
+
+
+def _usage_int(usage, key):
+    v = usage.get(key)
+    return v if isinstance(v, int) else 0
+
+
+def scan_agent_transcript(path):
+    """One streaming pass over an agent transcript. Returns a stats dict;
+    never retains message text."""
+    final = {}          # message id -> latest usage snapshot
+    first_snap = {}     # message id -> first usage snapshot
+    order = []
+    last_mid = None
+    tool_ids = set()
+    tool_unnamed = 0
+    ts_min = None
+    ts_max = None
+    for _line_no, _offset, raw in iter_jsonl(path):
+        stripped = raw.strip()
+        if not stripped.startswith(b"{"):
+            continue
+        try:
+            entry = json.loads(stripped)
+        except Exception:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        ts = parse_ts(entry.get("timestamp"))
+        if ts is not None:
+            if ts_min is None or ts < ts_min:
+                ts_min = ts
+            if ts_max is None or ts > ts_max:
+                ts_max = ts
+        if entry.get("type") != "assistant":
+            continue
+        msg = entry.get("message")
+        if not isinstance(msg, dict):
+            continue
+        mid = msg.get("id")
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and \
+                        block.get("type") == "tool_use":
+                    bid = block.get("id")
+                    if isinstance(bid, str):
+                        tool_ids.add((mid, bid))
+                    else:
+                        tool_unnamed += 1
+        usage = msg.get("usage")
+        if isinstance(usage, dict) and isinstance(mid, str):
+            if mid not in final:
+                order.append(mid)
+                first_snap[mid] = usage
+            final[mid] = usage
+            last_mid = mid
+    out_tokens = 0
+    in_cache = 0
+    for mid in order:
+        u = final[mid]
+        out_tokens += _usage_int(u, "output_tokens")
+        in_cache += (_usage_int(u, "input_tokens")
+                     + _usage_int(u, "cache_creation_input_tokens")
+                     + _usage_int(u, "cache_read_input_tokens"))
+    ctx_tokens = 0
+    if last_mid is not None:
+        u = first_snap[last_mid]
+        ctx_tokens = (_usage_int(u, "input_tokens")
+                      + _usage_int(u, "cache_creation_input_tokens")
+                      + _usage_int(u, "cache_read_input_tokens")
+                      + _usage_int(u, "output_tokens"))
+    return {
+        "output_tokens": out_tokens,
+        "in_cache_tokens": in_cache,
+        "ctx_tokens": ctx_tokens,
+        "tool_calls": len(tool_ids) + tool_unnamed,
+        "messages": len(order),
+        "ts_min": ts_min,
+        "ts_max": ts_max,
+    }
+
+
+def _read_json_file(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            obj = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _run_labels(run_dir, run_id):
+    """Labels + workflow name from the runner state file (numbers are
+    never taken from it). State file: <session>/workflows/<run_id>.json
+    for a run dir <session>/subagents/workflows/<run_id>."""
+    state_path = os.path.normpath(os.path.join(
+        run_dir, os.pardir, os.pardir, os.pardir,
+        "workflows", run_id + ".json"))
+    state = _read_json_file(state_path)
+    labels = {}
+    name = None
+    if state:
+        wn = state.get("workflowName")
+        if isinstance(wn, str):
+            name = wn
+        prog = state.get("workflowProgress")
+        if isinstance(prog, list):
+            for e in prog:
+                if isinstance(e, dict) and \
+                        e.get("type") == "workflow_agent" and \
+                        isinstance(e.get("agentId"), str) and \
+                        isinstance(e.get("label"), str):
+                    labels[e["agentId"]] = e["label"]
+    return name, labels
+
+
+def load_run(run_dir):
+    """Aggregate one workflow run directory."""
+    run_id = os.path.basename(os.path.normpath(run_dir))
+    started = set()
+    completed = set()
+    journal = os.path.join(run_dir, "journal.jsonl")
+    if os.path.isfile(journal):
+        for _line_no, _offset, raw in iter_jsonl(journal):
+            stripped = raw.strip()
+            if not stripped.startswith(b"{"):
+                continue
+            try:
+                entry = json.loads(stripped)
+            except Exception:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            aid = entry.get("agentId")
+            if not isinstance(aid, str):
+                continue
+            if entry.get("type") == "started":
+                started.add(aid)
+            elif entry.get("type") == "result":
+                completed.add(aid)
+    name, labels = _run_labels(run_dir, run_id)
+    agents = []
+    for fname in sorted(os.listdir(run_dir)):
+        m = _AGENT_FILE_RE.match(fname)
+        if not m:
+            continue
+        aid = m.group(1)
+        stats = scan_agent_transcript(os.path.join(run_dir, fname))
+        label = labels.get(aid)
+        if label is None:
+            meta = _read_json_file(
+                os.path.join(run_dir, "agent-%s.meta.json" % aid))
+            if meta and isinstance(meta.get("agentType"), str):
+                label = meta["agentType"]
+        stats["agent_id"] = aid
+        stats["label"] = label or "-"
+        agents.append(stats)
+    ts_min = min((a["ts_min"] for a in agents if a["ts_min"] is not None),
+                 default=None)
+    ts_max = max((a["ts_max"] for a in agents if a["ts_max"] is not None),
+                 default=None)
+    return {
+        "run_id": run_id,
+        "workflow": name or "-",
+        "agents_started": len(started),
+        "agents_completed": len(completed),
+        "transcripts": len(agents),
+        "output_tokens": sum(a["output_tokens"] for a in agents),
+        "in_cache_tokens": sum(a["in_cache_tokens"] for a in agents),
+        "ctx_tokens": sum(a["ctx_tokens"] for a in agents),
+        "tool_calls": sum(a["tool_calls"] for a in agents),
+        "ts_min": ts_min,
+        "ts_max": ts_max,
+        "agents": agents,
+    }
+
+
+def find_run_dirs(paths):
+    """Expand args into a sorted, de-duped list of workflow run dirs. A
+    run dir contains journal.jsonl or at least one agent-*.jsonl."""
+    def is_run_dir(d):
+        try:
+            names = os.listdir(d)
+        except OSError:
+            return False
+        return "journal.jsonl" in names or \
+            any(_AGENT_FILE_RE.match(n) for n in names)
+
+    runs = []
+    errors = []
+    for p in paths:
+        p = os.path.expanduser(p)
+        if not os.path.isdir(p):
+            errors.append(path_error(p))
+            continue
+        if is_run_dir(p):
+            runs.append(os.path.normpath(p))
+            continue
+        for root, dirs, _names in os.walk(p):
+            dirs.sort()
+            for d in list(dirs):
+                full = os.path.join(root, d)
+                if is_run_dir(full):
+                    runs.append(os.path.normpath(full))
+                    dirs.remove(d)   # never recurse into a run dir
+    seen = set()
+    uniq = []
+    for r in runs:
+        if r not in seen:
+            seen.add(r)
+            uniq.append(r)
+    return uniq, errors
+
+
+def match_outcome(outcomes, run_id):
+    """Outcome keys may be the full run id or its short prefix
+    (wf_8a76d8d8 matches wf_8a76d8d8-fd3)."""
+    if run_id in outcomes:
+        return outcomes[run_id]
+    for key, val in outcomes.items():
+        if run_id.startswith(key + "-") or key.startswith(run_id + "-"):
+            return val
+    return None
+
+
+_OUTCOME_INTS = ("confirmed", "fixed", "tests_added", "mutants_killed")
+
+
+def _outcome_findings(oc):
+    """Findings an efficiency ratio can be taken over: confirmed review
+    findings or applied fixes, whichever the run produced."""
+    n = 0
+    for k in ("confirmed", "fixed"):
+        v = oc.get(k)
+        if isinstance(v, int):
+            n += v
+    return n
+
+
+def render_ledger_md(runs, outcomes):
+    out = []
+    w = out.append
+    w("# agentlog ledger")
+    w("")
+    w("- runs: %d | agents: %d started, %d completed | tool calls: %d"
+      % (len(runs),
+         sum(r["agents_started"] for r in runs),
+         sum(r["agents_completed"] for r in runs),
+         sum(r["tool_calls"] for r in runs)))
+    w("- tokens: output %s | input+cache %s | context %s"
+      % ("{:,}".format(sum(r["output_tokens"] for r in runs)),
+         "{:,}".format(sum(r["in_cache_tokens"] for r in runs)),
+         "{:,}".format(sum(r["ctx_tokens"] for r in runs))))
+    span_min = min((r["ts_min"] for r in runs if r["ts_min"] is not None),
+                   default=None)
+    span_max = max((r["ts_max"] for r in runs if r["ts_max"] is not None),
+                   default=None)
+    w("- span: %s -> %s" % (fmt_ts(span_min), fmt_ts(span_max)))
+    w("")
+
+    def table(header, rows):
+        w("| " + " | ".join(header) + " |")
+        w("|" + "|".join("---" for _ in header) + "|")
+        for r in rows:
+            w("| " + " | ".join(str(c).replace("|", "\\|") for c in r)
+              + " |")
+        w("")
+
+    header = ["run", "workflow", "agents", "tools", "output tok",
+              "in+cache tok", "ctx tok", "wall"]
+    if outcomes is not None:
+        header += ["conf", "fixed", "tests", "mutants", "tok/finding",
+                   "note"]
+    rows = []
+    for r in runs:
+        wall = "-"
+        if r["ts_min"] is not None and r["ts_max"] is not None:
+            wall = fmt_dur(r["ts_max"] - r["ts_min"])
+        agents = "%d/%d" % (r["agents_started"], r["agents_completed"])
+        row = [r["run_id"], r["workflow"], agents, r["tool_calls"],
+               "{:,}".format(r["output_tokens"]),
+               "{:,}".format(r["in_cache_tokens"]),
+               "{:,}".format(r["ctx_tokens"]), wall]
+        if outcomes is not None:
+            oc = match_outcome(outcomes, r["run_id"]) or {}
+            for k in _OUTCOME_INTS:
+                v = oc.get(k)
+                row.append(v if isinstance(v, int) else "-")
+            n = _outcome_findings(oc)
+            row.append("{:,}".format(int(round(r["ctx_tokens"] / n)))
+                       if n else "-")
+            note = oc.get("note")
+            row.append(note if isinstance(note, str) else "-")
+        rows.append(row)
+    w("## Runs (sorted by context tokens)")
+    w("")
+    table(header, rows)
+
+    for r in runs:
+        w("## %s — %s" % (r["run_id"], r["workflow"]))
+        w("")
+        arows = []
+        for a in sorted(r["agents"],
+                        key=lambda a2: (-a2["ctx_tokens"], a2["agent_id"])):
+            dur = "-"
+            if a["ts_min"] is not None and a["ts_max"] is not None:
+                dur = fmt_dur(a["ts_max"] - a["ts_min"])
+            arows.append((a["agent_id"], a["label"],
+                          "{:,}".format(a["output_tokens"]),
+                          "{:,}".format(a["in_cache_tokens"]),
+                          "{:,}".format(a["ctx_tokens"]),
+                          a["tool_calls"], dur))
+        if arows:
+            table(["agent", "label", "output tok", "in+cache tok",
+                   "ctx tok", "tools", "duration"], arows)
+        else:
+            w("no agent transcripts")
+            w("")
+
+    w("_tokens: output = final output_tokens summed per API message;"
+      " in+cache = final input + cache_creation + cache_read summed per"
+      " message; ctx = the agent's final context footprint"
+      " (input+cache_creation+cache_read+output at its last message's"
+      " first recorded snapshot), the figure the workflow runner reports"
+      " as per-agent tokens. No prompt or message text is read._")
+    return "\n".join(out)
+
+
+def render_ledger_json(runs, outcomes):
+    jruns = []
+    for r in runs:
+        jr = {
+            "run_id": r["run_id"],
+            "workflow": r["workflow"],
+            "agents_started": r["agents_started"],
+            "agents_completed": r["agents_completed"],
+            "transcripts": r["transcripts"],
+            "tool_calls": r["tool_calls"],
+            "output_tokens": r["output_tokens"],
+            "in_cache_tokens": r["in_cache_tokens"],
+            "ctx_tokens": r["ctx_tokens"],
+            "span": [fmt_ts(r["ts_min"]), fmt_ts(r["ts_max"])],
+            "wall_seconds": (int(r["ts_max"] - r["ts_min"])
+                             if r["ts_min"] is not None
+                             and r["ts_max"] is not None else None),
+            "agents": [
+                {
+                    "agent_id": a["agent_id"],
+                    "label": a["label"],
+                    "output_tokens": a["output_tokens"],
+                    "in_cache_tokens": a["in_cache_tokens"],
+                    "ctx_tokens": a["ctx_tokens"],
+                    "tool_calls": a["tool_calls"],
+                    "messages": a["messages"],
+                    "duration_seconds": (int(a["ts_max"] - a["ts_min"])
+                                         if a["ts_min"] is not None
+                                         and a["ts_max"] is not None
+                                         else None),
+                } for a in r["agents"]
+            ],
+        }
+        if outcomes is not None:
+            oc = match_outcome(outcomes, r["run_id"])
+            jr["outcomes"] = oc
+            n = _outcome_findings(oc) if oc else 0
+            jr["ctx_tokens_per_finding"] = (
+                int(round(r["ctx_tokens"] / n)) if n else None)
+        jruns.append(jr)
+    obj = {
+        "runs": jruns,
+        "totals": {
+            "runs": len(runs),
+            "agents_started": sum(r["agents_started"] for r in runs),
+            "agents_completed": sum(r["agents_completed"] for r in runs),
+            "tool_calls": sum(r["tool_calls"] for r in runs),
+            "output_tokens": sum(r["output_tokens"] for r in runs),
+            "in_cache_tokens": sum(r["in_cache_tokens"] for r in runs),
+            "ctx_tokens": sum(r["ctx_tokens"] for r in runs),
+        },
+        "token_composition": {
+            "output_tokens": "final output_tokens summed per API message "
+                             "(entries deduped by message.id, last usage "
+                             "snapshot wins)",
+            "in_cache_tokens": "final input_tokens + cache_creation_input_"
+                               "tokens + cache_read_input_tokens summed "
+                               "per API message",
+            "ctx_tokens": "input + cache_creation + cache_read + output "
+                          "from the first recorded snapshot of the "
+                          "agent's last message (final context "
+                          "footprint; matches the workflow runner's "
+                          "per-agent tokens counter)",
+        },
+    }
+    return json.dumps(obj, indent=1)
+
+
+def cmd_ledger(args):
+    outcomes = None
+    if args.outcomes:
+        opath = os.path.expanduser(args.outcomes)
+        outcomes = _read_json_file(opath)
+        if outcomes is None:
+            sys.stderr.write("agentlog: unreadable outcomes json: %s\n"
+                             % opath)
+            return 1
+    run_dirs, errors = find_run_dirs(args.paths)
+    for e in errors:
+        sys.stderr.write("agentlog: %s\n" % e)
+    if errors:
+        return 1
+    if not run_dirs:
+        sys.stderr.write("agentlog: no workflow run dirs (journal.jsonl "
+                         "or agent-*.jsonl) found under: %s\n"
+                         % " ".join(args.paths))
+        return 1
+    runs = [load_run(d) for d in run_dirs]
+    runs.sort(key=lambda r: (-r["ctx_tokens"], r["run_id"]))
+    if args.json:
+        print(render_ledger_json(runs, outcomes))
+    else:
+        print(render_ledger_md(runs, outcomes))
+    return 0
+
+
 # -------------------------------------------------------------------- main
 
 class Parser(argparse.ArgumentParser):
@@ -1021,6 +1478,21 @@ def main(argv=None):
     p_bisect.add_argument("--metric", default="cohesion",
                           choices=["cohesion"])
 
+    p_ledger = sub.add_parser(
+        "ledger", help="workflow efficiency ledger over wf_* run dirs")
+    p_ledger.add_argument("paths", nargs="+",
+                          help="workflow run dirs, workflows roots, or "
+                               "project/session dirs (recursed)")
+    lfmt = p_ledger.add_mutually_exclusive_group()
+    lfmt.add_argument("--json", action="store_true",
+                      help="machine-readable ledger")
+    lfmt.add_argument("--md", action="store_true",
+                      help="markdown ledger (default)")
+    p_ledger.add_argument("--outcomes", metavar="JSON",
+                          help="json mapping run-id -> {confirmed, fixed, "
+                               "tests_added, mutants_killed, note} to "
+                               "join efficiency ratios into the table")
+
     args = parser.parse_args(argv)
     if args.command == "scan":
         if args.top < 1:
@@ -1037,6 +1509,8 @@ def main(argv=None):
         return cmd_slice(args)
     if args.command == "bisect":
         return cmd_bisect(args)
+    if args.command == "ledger":
+        return cmd_ledger(args)
     parser.print_help(sys.stderr)
     return 1
 

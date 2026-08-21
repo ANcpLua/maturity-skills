@@ -56,6 +56,22 @@ never applied by the agent.
 matching and counting; error clustering normalizes paths, ids, and numbers
 out of the first error line. Same corpus in, same findings out.
 
+## Workflow efficiency ledger
+
+`agentlog.py ledger <workflows-root-or-project-dir>...` turns subagent
+workflow runs (`wf_*/` dirs with `journal.jsonl` and per-agent
+transcripts) into a cost table: agents started/completed, tool calls,
+output tokens, input+cache tokens, context tokens (each agent's final
+context footprint, matching the workflow runner's own per-agent counter),
+wall and per-agent durations, and agent labels — deterministic,
+streaming, byte-identical on rerun, and label/number-only like the rest
+of the tool. `--outcomes <json>` joins per-run results (`confirmed`,
+`fixed`, `tests_added`, `mutants_killed`, `note`) and adds
+tokens-per-finding, so fleet-size and wave-structure decisions for the
+next maintenance run are priced against what comparable runs actually
+cost. Run it before starting a new target; keep the outcomes file
+current; pick the shapes with the cheapest tokens-per-finding.
+
 ## It's working if
 
 A 600 MB corpus scans in seconds within a bounded memory footprint, every

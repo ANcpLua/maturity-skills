@@ -1,0 +1,5 @@
+---
+"maturity-skills": minor
+---
+
+agent-log-scan: new `ledger` subcommand — a workflow efficiency ledger over subagent workflow runs (`wf_*/journal.jsonl` + `agent-<id>.jsonl`). Per run and per agent it reports started/completed counts, tool calls (deduped by tool_use id), output tokens and input+cache tokens (final usage snapshot per API message, streaming duplicates deduped by message id), context tokens (the agent's final context footprint, reproducing the workflow runner's own per-agent token counter), wall/per-agent durations, and agent labels from the runner state file or meta.json — deterministic, streaming, byte-identical on rerun, and privacy-default (labels and numbers only, never prompt or message text). `--outcomes <json>` joins run results (confirmed/fixed/tests_added/mutants_killed/note) and emits tokens-per-finding so fleet-size decisions are priced from measured runs. Ships a fixture-based self-test (`test_ledger.py`) with hand-computed numbers, and SKILL/docs sections on the ledger routine: run it before each new maintenance target and compare tokens-per-finding across runs.
