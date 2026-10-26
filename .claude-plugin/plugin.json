@@ -1,6 +1,6 @@
 {
   "name": "maturity-skills",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Evidence-first maintenance routines for codebases: mutation testing, emitter-corpus validation, performance-claim gating, agent-transcript antipattern scanning, regression review of a change-set's own diff, and the full maintenance-run orchestration with a hard termination rule. Findings need repros, not vibes.",
   "author": {
     "name": "ANcpLua",
